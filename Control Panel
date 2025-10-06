@@ -1,0 +1,80 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <LiquidCrystal_I2C.h>
+
+// Set the LCD address to 0x27 and size to 16x2
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Output pins
+#define redPin 32  // Built-in LED on many ESP32 boards
+#define greenPin 33
+#define buzzerPin 23
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  uint8_t value = *incomingData;
+
+  Serial.print("From MAC: ");
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2],
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+  Serial.println(macStr);
+
+  Serial.print("Received data: ");
+  Serial.println(value);
+
+  if (value == 1) {
+    digitalWrite(redPin, HIGH);
+    digitalWrite(greenPin, LOW);
+    lcd.clear();
+    lcd.setCursor(1, 0);  // 3rd column, 1st row (indexes start at 0)
+    lcd.print("Drowning Detected");
+    lcd.setCursor(2, 1);  // 3rd column, 1st row (indexes start at 0)
+    lcd.print("Watch: ONE");
+    tone(buzzerPin, 500, 2000);
+    
+  } else if(value == 2){ 
+    lcd.clear();
+    lcd.setCursor(3, 0);  // 3rd column, 1st row (indexes start at 0)
+    lcd.print("AQUA PULSE");
+    digitalWrite(redPin, LOW);
+    digitalWrite(greenPin, LOW);
+  } else {
+  //  lcd.clear();
+   // lcd.setCursor(2, 0);  // 3rd column, 1st row (indexes start at 0)
+   // lcd.print("Not Drowning");
+   lcd.setCursor(3, 0);  // 3rd column, 1st row (indexes start at 0)
+    lcd.print("AQUA PULSE");
+    digitalWrite(redPin, LOW);
+    digitalWrite(greenPin, HIGH);
+  //  tone(buzzerPin, 500, 200);  // Different tone
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  lcd.init();  // Initialize LCD
+  lcd.backlight();
+
+
+  WiFi.mode(WIFI_STA);
+  delay(100);  // Give some time for WiFi hardware to initialize
+  Serial.print("ESP32 Receiver MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+}
+
+void loop() {
+  // Nothing needed
+}
