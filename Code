@@ -1,0 +1,232 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <MPU6050.h>
+#include "HX711.h"
+#include <SPI.h>
+#include <RF24.h>
+
+// Display setup
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// MPU6050 setup
+MPU6050 mpu;
+
+// HX711 Pressure Sensor setup
+#define DT D2   // HX711 Data pin
+#define SCK D3  // HX711 Clock pin
+HX711 pressureSensor;
+
+// NRF24 setup
+const byte CE_PIN  = D6;
+const byte CSN_PIN = D1;
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "STAT1";
+struct Packet { uint8_t status; } data;
+
+unsigned long lowPressureStartTime = 0;
+bool lowPressureActive = false;
+long initialPressure = 0;
+
+unsigned long samplingStartTime = 0;
+int sampleCount = 0;
+bool samplingActive = false;
+bool showFinalStatus = false;
+unsigned long statusDisplayStartTime = 0;
+
+int drowningCount = 0;
+int normalCount = 0;
+
+int lastPulse = 0;
+unsigned long lowPulseStartTime = 0;
+unsigned long highPulseStartTime = 0;
+bool suddenDropDetected = false;
+
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 not connected!");
+    while (1);
+  } else {
+    Serial.println("MPU6050 connected");
+  }
+
+  pressureSensor.begin(DT, SCK);
+  delay(1000);
+  if (!pressureSensor.is_ready()) {
+    Serial.println("Pressure sensor not found!");
+    while (1);
+  }
+
+  initialPressure = pressureSensor.read();
+  Serial.print("Initial Pressure Offset: ");
+  Serial.println(initialPressure);
+
+  lastPulse = analogRead(A0); // initialize last pulse
+
+  // NRF24 init
+  radio.begin();
+  radio.setDataRate(RF24_250KBPS);
+  radio.openWritingPipe(address);
+  radio.stopListening();
+}
+
+void loop() {
+  long rawPressure = pressureSensor.read();
+  long adjustedPressure = rawPressure - initialPressure;
+
+  if (adjustedPressure > 7000) {
+    lowPressureStartTime = 0;
+    lowPressureActive = true;
+  } else {
+    if (lowPressureStartTime == 0) {
+      lowPressureStartTime = millis();
+    }
+    if (millis() - lowPressureStartTime >= 10000) {
+      lowPressureActive = false;
+    }
+  }
+
+  if (lowPressureActive) {
+    if (!samplingActive) {
+      samplingStartTime = millis();
+      sampleCount = 0;
+      samplingActive = true;
+      showFinalStatus = false;
+      drowningCount = 0;
+      normalCount = 0;
+      lowPulseStartTime = 0;
+      highPulseStartTime = 0;
+      suddenDropDetected = false;
+    }
+
+    if (samplingActive && sampleCount < 200) {
+      int16_t ax, ay, az;
+      mpu.getAcceleration(&ax, &ay, &az);
+      float axg = ax / 16384.0;
+      float ayg = ay / 16384.0;
+      float azg = az / 16384.0;
+      float accMag = sqrt(axg * axg + ayg * ayg + azg * azg) * 10.0;
+
+      bool gyroDrowning = false;
+      if ((accMag < 11 && accMag > 8) || accMag > 20) {
+        gyroDrowning = true;
+      }
+
+      int rawPulse = analogRead(A0);
+      int pulse = map(rawPulse, 0, 4095, 180, 60);
+      bool pulseDrowning = false;
+
+      if (pulse < 70) {
+        if (lowPulseStartTime == 0) lowPulseStartTime = millis();
+        if (millis() - lowPulseStartTime >= 5000) pulseDrowning = true;
+      } else {
+        lowPulseStartTime = 0;
+      }
+
+      if (pulse > 160) {
+        if (highPulseStartTime == 0) highPulseStartTime = millis();
+        if (millis() - highPulseStartTime >= 5000) pulseDrowning = true;
+      } else {
+        highPulseStartTime = 0;
+      }
+
+      if (lastPulse - pulse > 30) {
+        suddenDropDetected = true;
+      }
+      lastPulse = pulse;
+
+      if (suddenDropDetected && pulse < 70) {
+        pulseDrowning = true;
+      }
+      suddenDropDetected = false;
+
+      bool isDrowning = !pulseDrowning ? false : (gyroDrowning || pulseDrowning);
+
+      if (isDrowning) {
+        drowningCount++;
+      } else {
+        normalCount++;
+      }
+
+      sampleCount++;
+
+      Serial.print("Sample ");
+      Serial.print(sampleCount);
+      Serial.print(" | AccMag: ");
+      Serial.print(accMag);
+      Serial.print(" | Pressure: ");
+      Serial.print(adjustedPressure);
+      Serial.print(" | Pulse: ");
+      Serial.print(pulse);
+      Serial.print(" | DrownCnt: ");
+      Serial.print(drowningCount);
+      Serial.print(" | NormCnt: ");
+      Serial.println(normalCount);
+
+      u8g2.clearBuffer();
+      u8g2.drawStr(0, 12, "Collecting Samples...");
+      char buff[30];
+      sprintf(buff, "Collected: %d samples", sampleCount);
+      u8g2.drawStr(0, 35, buff);
+      char pulseLine[30];
+      sprintf(pulseLine, "V. Pulse: %d bpm", pulse);
+      u8g2.drawStr(0, 64, pulseLine);
+      u8g2.sendBuffer();
+
+      delay(100);
+    }
+
+    if (sampleCount >= 200 && !showFinalStatus) {
+      showFinalStatus = true;
+      statusDisplayStartTime = millis();
+
+      // Send NRF data: 1 = drowning, 0 = normal
+      data.status = (drowningCount > normalCount) ? 1 : 0;
+      radio.write(&data, sizeof(data));
+    }
+
+    if (showFinalStatus) {
+      float ratio = drowningCount > normalCount ?
+                    (float)drowningCount / 200.0 :
+                    (float)normalCount / 200.0;
+
+      u8g2.clearBuffer();
+      u8g2.drawStr(0, 20, "Final Status:");
+
+      char result[32];
+      if (drowningCount > normalCount) {
+        sprintf(result, "⚠️  %.2f DROWNING", ratio);
+      } else {
+        sprintf(result, "✅ %.2f NORMAL", ratio);
+      }
+
+      u8g2.drawStr(0, 45, result);
+      u8g2.sendBuffer();
+
+      Serial.print("Final Decision: ");
+      Serial.println(result);
+
+      if (millis() - statusDisplayStartTime > 2000) {
+        samplingActive = false;
+        showFinalStatus = false;
+        suddenDropDetected = false;
+      }
+      delay(50);
+      return;
+    }
+  } else {
+    u8g2.clearBuffer();
+    u8g2.drawStr(30, 15, "AQUA PULSE");
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.drawStr(10, 40, "The device will be");
+    u8g2.drawStr(10, 52, "activated when the ");
+    u8g2.drawStr(5, 64, "user enters in water");
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.sendBuffer();
+  }
+}
